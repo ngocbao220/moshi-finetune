@@ -1,9 +1,10 @@
 import itertools
 import json
 import logging
+import math
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator
+from typing import Iterator, Protocol
 
 import numpy as np
 import sphn
@@ -18,6 +19,12 @@ logger = logging.getLogger("dataset")
 
 AudioChunkPath = tuple[str, float]
 _LOADED_DATASETS: dict[Path, list[AudioChunkPath]] = {}
+
+
+class EpochProgress(Protocol):
+    def start_epoch(self, epoch: int, total: int) -> None: ...
+
+    def advance_epoch(self) -> None: ...
 
 
 def main_logger_info(message: str) -> None:
@@ -142,6 +149,28 @@ def parse_data_sources(
     return sources, n_weights
 
 
+def has_exact_epoch_progress(pretrain_data: str) -> bool:
+    sources, _ = parse_data_sources(pretrain_data)
+    return len(sources) == 1
+
+
+def count_samples_per_epoch(
+    jsonl_file: Path, duration_sec: float, rank: int, world_size: int
+) -> int:
+    """Count this rank's padded segments using sphn's sequential sharding rule."""
+    sample_index = 0
+    count = 0
+    with jsonl_file.open() as file:
+        for line in file:
+            duration = json.loads(line)["duration"]
+            num_segments = math.ceil(duration / duration_sec)
+            for _ in range(num_segments):
+                if sample_index % world_size == rank:
+                    count += 1
+                sample_index += 1
+    return count
+
+
 def build_dataset(
     pretrain_data: str,
     instruct_tokenizer: InterleavedTokenizer,
@@ -150,10 +179,14 @@ def build_dataset(
     world_size: int,
     is_eval: bool,
     shuffle_pretrain: bool = False,
+    epoch_progress: EpochProgress | None = None,
 ) -> Iterator[Sample]:
     sources, probabilities = parse_data_sources(pretrain_data=pretrain_data)
 
     shuffle = not is_eval and shuffle_pretrain
+
+    if len(sources) != 1:
+        epoch_progress = None
 
     dataset_iterators = [
         get_dataset_iterator(
@@ -164,6 +197,7 @@ def build_dataset(
             is_finite=is_eval,
             seed=seed,
             shuffle_at_epoch=shuffle,
+            epoch_progress=epoch_progress,
         )
         for source in sources
     ]
@@ -195,10 +229,25 @@ def get_dataset_iterator(
     is_finite: bool,
     seed: int | None,
     shuffle_at_epoch: bool,
+    epoch_progress: EpochProgress | None = None,
 ) -> Iterator[Sample]:
     epoch = 1
     while True:
-        for jsonl_file in source.jsonl_files:
+        jsonl_files = source.jsonl_files
+        if epoch_progress is not None:
+            epoch_progress.start_epoch(
+                epoch,
+                sum(
+                    count_samples_per_epoch(
+                        jsonl_file,
+                        duration_sec=instruct_tokenizer.duration_sec,
+                        rank=rank,
+                        world_size=world_size,
+                    )
+                    for jsonl_file in jsonl_files
+                ),
+            )
+        for jsonl_file in jsonl_files:
             dataset = sphn.dataset_jsonl(
                 str(jsonl_file),
                 duration_sec=instruct_tokenizer.duration_sec,
@@ -215,10 +264,15 @@ def get_dataset_iterator(
                 dataset = dataset.seq(skip=rank, step_by=world_size)
             for sample in dataset:
                 wav = sample["data"][..., : sample["unpadded_len"]]
-                yield instruct_tokenizer(wav, sample["start_time_sec"], sample["path"])
+                tokenized_sample = instruct_tokenizer(
+                    wav, sample["start_time_sec"], sample["path"]
+                )
+                if epoch_progress is not None:
+                    epoch_progress.advance_epoch()
+                yield tokenized_sample
         if is_finite:
             break
-        print(f"Rank {rank} finished epoch {epoch}")
+        main_logger_info(f"Finished epoch {epoch}")
         epoch += 1
 
 

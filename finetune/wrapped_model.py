@@ -15,6 +15,7 @@ from torch.distributed.fsdp.fully_sharded_data_parallel import FullyShardedDataP
 
 from .args import TrainArgs
 from .distributed import get_rank, get_world_size
+from .monitoring.utils import format_parameter_summary
 
 logger = logging.getLogger(__name__)
 
@@ -66,10 +67,7 @@ def log_train_params(model: Union[torch.nn.Module, FullyShardedDataParallel]):
         p.numel() for p in model.parameters() if p.requires_grad
     )
 
-    main_logger_info(
-        f"{num_train_params:,.0f} out of {num_params:,.0f} parameters are finetuned "
-        f"({num_train_params / num_params * 100:.2f}%)."
-    )
+    main_logger_info(format_parameter_summary(num_params, num_train_params))
 
 
 def initialize_lora_parameters(model: torch.nn.Module, param_dtype: torch.dtype):
@@ -203,7 +201,5 @@ def get_fsdp_model(
     )
 
     main_logger_info("Model sharded!")
-
-    log_train_params(wrapped_model)
 
     return wrapped_model

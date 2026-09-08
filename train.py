@@ -9,13 +9,14 @@ from pathlib import Path
 import fire
 import torch.cuda
 import torch.distributed as dist
+from moshi.models import loaders
 from torch.optim import AdamW, lr_scheduler
 
 # from torch.profiler import ProfilerActivity, profile
-
 from finetune.args import TrainArgs
 from finetune.checkpointing import Checkpointer
 from finetune.data.data_loader import build_data_loader
+from finetune.data.dataset import has_exact_epoch_progress
 from finetune.data.interleaver import InterleavedTokenizer, Interleaver
 from finetune.distributed import (
     BACKEND,
@@ -39,10 +40,9 @@ from finetune.monitoring.metrics_logger import (
     get_train_logs,
     train_log_msg,
 )
-from finetune.monitoring.utils import set_logger
+from finetune.monitoring.utils import TrainingProgress, set_logger
 from finetune.utils import TrainState, logged_closing, set_random_seed
-from finetune.wrapped_model import get_fsdp_model
-from moshi.models import loaders
+from finetune.wrapped_model import get_fsdp_model, log_train_params
 
 logger = logging.getLogger("train")
 
@@ -50,6 +50,13 @@ logger = logging.getLogger("train")
 def main_logger_info(message: str) -> None:
     if get_rank() == 0:
         logger.info(message)
+
+
+def redacted_train_config(args: TrainArgs) -> dict:
+    config = dataclasses.asdict(args)
+    if config["wandb"]["key"] is not None:
+        config["wandb"]["key"] = "<redacted>"
+    return config
 
 
 def train(config: str):
@@ -102,7 +109,8 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
     if not args_path.exists():
         args.save(args_path)
 
-    main_logger_info(f"TrainArgs: {pprint.pformat(dataclasses.asdict(args))}")
+    train_config = redacted_train_config(args)
+    main_logger_info(f"Hyperparameters: {pprint.pformat(train_config)}")
 
     # 3. Get loggers
     metrics_logger: MetricsLogger = MetricsLogger(
@@ -110,7 +118,7 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
         tag="train",
         is_master=get_rank() == 0,
         wandb_args=args.wandb,
-        config=dataclasses.asdict(args),
+        config=train_config,
     )
     exit_stack.enter_context(logged_closing(metrics_logger, "metrics_logger"))
 
@@ -119,7 +127,7 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
         tag="eval",
         is_master=get_rank() == 0,
         wandb_args=args.wandb,
-        config=dataclasses.asdict(args),
+        config=train_config,
     )
     exit_stack.enter_context(logged_closing(eval_logger, "eval_logger"))
 
@@ -149,6 +157,7 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
 
     # 4.2 Load and shard model, prepare interleaver for audio/text tokens.
     model = get_fsdp_model(args, checkpoint_info)
+    log_train_params(model)
 
     spm = checkpoint_info.get_text_tokenizer()
 
@@ -165,6 +174,20 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
     )
 
     # 5. Load data loaders
+    exact_epoch_progress = has_exact_epoch_progress(args.data.train_data)
+    train_progress = (
+        TrainingProgress(args.max_steps, epoch_mode=exact_epoch_progress)
+        if get_rank() == 0
+        else None
+    )
+    if train_progress is not None:
+        exit_stack.callback(train_progress.close)
+        if not exact_epoch_progress:
+            main_logger_info(
+                "Multiple weighted data sources: using optimizer-step progress because "
+                "there is no single exact epoch."
+            )
+
     data_loader = build_data_loader(
         instruct_tokenizer=interleaved_tokenizer,
         args=args.data,
@@ -173,6 +196,7 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
         rank=get_rank(),  # DDP rank
         world_size=get_world_size(),  # DDP world_size
         is_eval=False,
+        epoch_progress=train_progress,
     )
 
     if args.do_eval:
@@ -330,6 +354,13 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
 
         # Timing
         state.end_step(n_batch_tokens)
+        if train_progress is not None:
+            train_progress.update_step(
+                step=state.step,
+                loss=avg_loss,
+                lr=last_lr,
+                eta_seconds=state.eta,
+            )
 
         if state.step % args.log_freq == 0:
             train_logs = get_train_logs(

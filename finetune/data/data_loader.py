@@ -1,7 +1,7 @@
 from typing import Any, Iterator
 
 from .args import DataArgs
-from .dataset import build_dataset
+from .dataset import EpochProgress, build_dataset
 from .interleaver import Batch
 
 
@@ -13,6 +13,7 @@ def build_data_loader(
     rank: int,
     world_size: int,
     is_eval: bool,
+    epoch_progress: EpochProgress | None = None,
 ) -> Iterator[Batch]:
     if is_eval:
         assert args.eval_data != "", "No eval data provided."
@@ -26,6 +27,7 @@ def build_data_loader(
         world_size=world_size,
         is_eval=is_eval,
         shuffle_pretrain=args.shuffle,
+        epoch_progress=epoch_progress,
     )
 
     sample_list = []
