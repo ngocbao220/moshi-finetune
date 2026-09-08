@@ -129,6 +129,34 @@ local_dir = snapshot_download(
 )
 ```
 
+### Prepare OtoSpeech from Hugging Face
+
+The gated [otoSpeech full-duplex dataset](https://huggingface.co/datasets/otoearth/otoSpeech-full-duplex-processed-141h)
+can be converted directly to Moshi's local WAV/JSONL format. First accept the
+dataset's access conditions on Hugging Face, then provide a read token through
+`HF_TOKEN`. The preparation command keeps OtoSpeech channel 0 as Moshi's output
+(the left channel) and channel 1 as the user input. When a sample has no valid
+timestamped alignment, it creates one with English Whisper timestamped ASR.
+
+Always set a limit: the command downloads shards sequentially and stops after
+the requested number of valid samples or hours.
+
+```sh
+export HF_TOKEN=...
+uv run python -m finetune.data.otospeech \
+  --output-dir data/otospeech \
+  --max-samples 100 \
+  --asr-model medium
+```
+
+This writes `train.jsonl`, stereo WAVs and matching alignment JSON files under
+`data/otospeech/`. Invalid samples are recorded in `rejected.jsonl`; the output
+directory must be new or empty so an interrupted run cannot silently mix data.
+
+To bound by total accepted duration instead, use `--max-hours 1`. The default
+Hugging Face cache is used; pass `--cache-dir /path/to/cache` when it must live
+elsewhere.
+
 If you want to annotate your own dataset and generate the `.json` transcripts for each
 audio file, you can use the `annotate.py` script:
 
@@ -159,6 +187,12 @@ max_steps: 2000
 
 ```sh
 torchrun --nproc-per-node 1 -m train example/moshi_7B.yaml
+```
+
+For prepared OtoSpeech, run the included LoRA configuration:
+
+```sh
+uv run torchrun --nproc-per-node 1 -m train example/otospeech_lora.yaml
 ```
 
 Note that you should still use `torchrun` even if you're only using a single GPU.
