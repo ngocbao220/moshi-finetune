@@ -1,5 +1,6 @@
 import io
 import json
+import sys
 import tarfile
 from pathlib import Path
 
@@ -14,6 +15,32 @@ class FakeWaveform:
 
     def __getitem__(self, item):
         return FakeWaveform(item.stop - item.start)
+
+
+def test_load_audio_uses_sphn_without_torchaudio(monkeypatch):
+    class FakeArray:
+        pass
+
+    class FakeSphn:
+        @staticmethod
+        def read(path):
+            assert Path(path).suffix == ".flac"
+            assert Path(path).read_bytes() == b"flac"
+            return FakeArray(), 16_000
+
+    class FakeTorch:
+        @staticmethod
+        def from_numpy(audio):
+            return audio
+
+    monkeypatch.setitem(sys.modules, "sphn", FakeSphn())
+    monkeypatch.setitem(sys.modules, "torch", FakeTorch())
+    monkeypatch.setitem(sys.modules, "torchaudio", None)
+
+    waveform, sample_rate = otospeech._load_audio(b"flac", ".flac")
+
+    assert isinstance(waveform, FakeArray)
+    assert sample_rate == 16_000
 
 
 def _write_archive(path: Path, members: dict[str, bytes]) -> None:

@@ -132,14 +132,21 @@ local_dir = snapshot_download(
 ### Prepare OtoSpeech from Hugging Face
 
 The gated [otoSpeech full-duplex dataset](https://huggingface.co/datasets/otoearth/otoSpeech-full-duplex-processed-141h)
-can be converted directly to Moshi's local WAV/JSONL format. First accept the
-dataset's access conditions on Hugging Face, then provide a read token through
-`HF_TOKEN`. The preparation command keeps OtoSpeech channel 0 as Moshi's output
-(the left channel) and channel 1 as the user input. When a sample has no valid
-timestamped alignment, it creates one with English Whisper timestamped ASR.
+can be prepared directly for Moshi. Training requires a CUDA-capable machine;
+preparation uses the GPU when available for Whisper timestamped ASR.
 
-Always set a limit: the command downloads shards sequentially and stops after
-the requested number of valid samples or hours.
+Before starting:
+
+1. Accept the dataset access conditions on Hugging Face.
+2. Create a Hugging Face read token and export it as `HF_TOKEN` (do not put it
+   in a config file or commit it).
+3. Choose a bounded preparation size. The dataset is large and the command
+   downloads shards sequentially.
+
+The default channel convention is preserved: OtoSpeech channel 0 (left) is the
+Moshi response to predict, and channel 1 (right) is the user input. A valid
+timestamped alignment from the source is reused; otherwise English Whisper
+timestamped ASR generates the alignment for channel 0.
 
 ```sh
 export HF_TOKEN=...
@@ -149,13 +156,24 @@ uv run python -m finetune.data.otospeech \
   --asr-model medium
 ```
 
-This writes `train.jsonl`, stereo WAVs and matching alignment JSON files under
-`data/otospeech/`. Invalid samples are recorded in `rejected.jsonl`; the output
-directory must be new or empty so an interrupted run cannot silently mix data.
+The command creates this training dataset:
+
+```
+data/otospeech/
+├── train.jsonl          # Input for data.train_data
+├── rejected.jsonl       # Samples skipped with a concrete error
+└── audio/
+    ├── <sample>.wav     # Stereo: Moshi left, user right
+    └── <sample>.json    # Timestamped alignments for Moshi
+```
+
+Only complete, stereo samples are added to `train.jsonl`. `rejected.jsonl`
+records invalid audio or ASR failures. The output directory must be new or
+empty; use a different directory for a fresh attempt rather than mixing runs.
 
 To bound by total accepted duration instead, use `--max-hours 1`. The default
 Hugging Face cache is used; pass `--cache-dir /path/to/cache` when it must live
-elsewhere.
+elsewhere. To reverse roles explicitly, use `--moshi-channel 1`.
 
 If you want to annotate your own dataset and generate the `.json` transcripts for each
 audio file, you can use the `annotate.py` script:

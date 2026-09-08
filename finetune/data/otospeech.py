@@ -1,10 +1,11 @@
 """Prepare gated OtoSpeech WebDataset shards for Moshi fine-tuning."""
 
 import argparse
-import io
 import json
 import os
 import tarfile
+import tempfile
+import wave
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Iterable
@@ -26,15 +27,26 @@ class PreparationResult:
 
 
 def _load_audio(content: bytes, suffix: str) -> tuple[Any, int]:
-    import torchaudio
+    import sphn
+    import torch
 
-    return torchaudio.load(io.BytesIO(content), format=suffix.removeprefix("."))
+    with tempfile.NamedTemporaryFile(suffix=suffix) as source:
+        source.write(content)
+        source.flush()
+        audio, sample_rate = sphn.read(source.name)
+    return torch.from_numpy(audio), sample_rate
 
 
 def _save_audio(path: Path, waveform: Any, sample_rate: int) -> None:
-    import torchaudio
+    import numpy as np
 
-    torchaudio.save(path, waveform, sample_rate, format="wav")
+    audio = waveform.detach().cpu().numpy().T
+    pcm = (np.clip(audio, -1.0, 1.0) * np.iinfo(np.int16).max).astype("<i2")
+    with wave.open(str(path), "wb") as output:
+        output.setnchannels(pcm.shape[1])
+        output.setsampwidth(2)
+        output.setframerate(sample_rate)
+        output.writeframes(pcm.tobytes())
 
 
 def _valid_alignments(value: object) -> Alignment | None:
@@ -96,9 +108,12 @@ def _default_transcriber(model_name: str) -> TranscribeChannel:
 
     def transcribe_channel(wav: Any, sample_rate: int) -> Alignment:
         if sample_rate != 16_000:
-            import torchaudio.functional as audio_functional
+            import sphn
 
-            wav = audio_functional.resample(wav, sample_rate, 16_000)
+            resampled = sphn.resample(
+                wav.squeeze(0).cpu().numpy(), sample_rate, 16_000
+            )
+            wav = torch.from_numpy(resampled).unsqueeze(0)
             sample_rate = 16_000
         result = whisper.transcribe(
             model,
